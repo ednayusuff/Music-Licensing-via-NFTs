@@ -218,3 +218,83 @@
     (ok true)
   )
 )
+
+
+(define-map license-renewal-settings
+  uint 
+  {
+    renewal-price: uint,
+    renewal-duration: uint
+  }
+)
+
+(define-public (set-renewal-terms (token-id uint) (price uint) (duration uint))
+  (let ((owner (unwrap! (nft-get-owner? music-license token-id) err-token-not-found)))
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (> price u0) err-invalid-price)
+    (asserts! (> duration u0) err-invalid-price)
+    
+    (map-set license-renewal-settings token-id {
+      renewal-price: price,
+      renewal-duration: duration
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (renew-license (token-id uint))
+  (let ((settings (unwrap! (map-get? license-renewal-settings token-id) (err u101)))
+        (rights (unwrap! (map-get? license-usage-rights token-id) err-token-not-found))
+        (owner (unwrap! (nft-get-owner? music-license token-id) err-token-not-found)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    
+    (try! (stx-transfer? (get renewal-price settings) tx-sender (get artist (unwrap! (get-royalty-info token-id) err-token-not-found))))
+    
+    (map-set license-usage-rights token-id 
+      (merge rights { duration: (+ (get duration rights) (get renewal-duration settings)) }))
+    
+    (ok true)
+  )
+)
+
+
+(define-map license-usage-log
+  { token-id: uint, usage-id: uint }
+  {
+    user: principal,
+    timestamp: uint,
+    usage-type: (string-ascii 50),
+    territory: (string-ascii 50)
+  }
+)
+
+(define-data-var usage-counter uint u0)
+
+(define-public (log-license-usage (token-id uint) (usage-type (string-ascii 50)) (territory (string-ascii 50)))
+  (let ((owner (unwrap! (nft-get-owner? music-license token-id) err-token-not-found))
+        (rights (unwrap! (map-get? license-usage-rights token-id) err-token-not-found))
+        (usage-id (+ (var-get usage-counter) u1)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    
+    (var-set usage-counter usage-id)
+    
+    (map-set license-usage-log 
+      { token-id: token-id, usage-id: usage-id }
+      {
+        user: tx-sender,
+        timestamp: stacks-block-height,
+        usage-type: usage-type,
+        territory: territory
+      }
+    )
+    
+    (ok usage-id)
+  )
+)
+
+(define-read-only (get-usage-log (token-id uint) (usage-id uint))
+  (map-get? license-usage-log { token-id: token-id, usage-id: usage-id })
+)
