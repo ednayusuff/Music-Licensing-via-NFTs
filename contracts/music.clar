@@ -298,3 +298,342 @@
 (define-read-only (get-usage-log (token-id uint) (usage-id uint))
   (map-get? license-usage-log { token-id: token-id, usage-id: usage-id })
 )
+
+
+(define-non-fungible-token collaborative-music-license uint)
+
+(define-data-var last-collaborative-token-id uint u0)
+
+(define-constant err-invalid-collaborator (err u200))
+(define-constant err-invalid-percentage (err u201))
+(define-constant err-not-collaborator (err u202))
+(define-constant err-insufficient-approvals (err u203))
+(define-constant err-collaborator-exists (err u204))
+(define-constant err-cannot-remove-self (err u205))
+
+(define-map collaborative-tokens
+  uint
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    creation-date: uint,
+    license-type: (string-ascii 20),
+    total-collaborators: uint,
+    approval-threshold: uint
+  }
+)
+
+(define-map collaborator-ownership
+  { token-id: uint, collaborator: principal }
+  {
+    ownership-percentage: uint,
+    is-active: bool,
+    join-date: uint
+  }
+)
+
+(define-map collaborator-approvals
+  { token-id: uint, action-id: uint, collaborator: principal }
+  bool
+)
+
+(define-map pending-actions
+  { token-id: uint, action-id: uint }
+  {
+    action-type: (string-ascii 20),
+    target-collaborator: principal,
+    new-percentage: uint,
+    approvals-count: uint,
+    is-executed: bool,
+    created-by: principal
+  }
+)
+
+(define-data-var action-counter uint u0)
+
+(define-map collaborative-listings
+  uint
+  {
+    price: uint,
+    approvals-count: uint,
+    required-approvals: uint,
+    is-active: bool
+  }
+)
+
+(define-map listing-approvals
+  { token-id: uint, collaborator: principal }
+  bool
+)
+
+(define-read-only (get-collaborative-token (token-id uint))
+  (map-get? collaborative-tokens token-id)
+)
+
+(define-read-only (get-collaborator-info (token-id uint) (collaborator principal))
+  (map-get? collaborator-ownership { token-id: token-id, collaborator: collaborator })
+)
+
+(define-read-only (is-collaborator (token-id uint) (user principal))
+  (match (map-get? collaborator-ownership { token-id: token-id, collaborator: user })
+    ownership (get is-active ownership)
+    false
+  )
+)
+
+(define-read-only (get-collaborative-listing (token-id uint))
+  (map-get? collaborative-listings token-id)
+)
+
+(define-public (create-collaborative-license 
+  (title (string-ascii 100))
+  (description (string-ascii 500))
+  (license-type (string-ascii 20))
+  (collaborators (list 10 principal))
+  (percentages (list 10 uint))
+  (approval-threshold uint))
+  
+  (let ((token-id (+ (var-get last-collaborative-token-id) u1))
+        (total-collaborators (len collaborators)))
+    
+    (asserts! (is-eq (len collaborators) (len percentages)) err-invalid-percentage)
+    (asserts! (> total-collaborators u0) err-invalid-collaborator)
+    (asserts! (<= approval-threshold total-collaborators) err-invalid-percentage)
+    (asserts! (is-eq (fold + percentages u0) u100) err-invalid-percentage)
+    
+    (try! (nft-mint? collaborative-music-license token-id tx-sender))
+    (var-set last-collaborative-token-id token-id)
+    
+    (map-set collaborative-tokens token-id {
+      title: title,
+      description: description,
+      creation-date: stacks-block-height,
+      license-type: license-type,
+      total-collaborators: total-collaborators,
+      approval-threshold: approval-threshold
+    })
+    
+    ;; (try! (add-collaborators-helper token-id collaborators percentages))
+    
+    (ok token-id)
+  )
+)
+
+;; (define-private (add-collaborators-helper (token-id uint) (collaborators (list 10 principal)) (percentages (list 10 uint)))
+;;   (let ((zipped-collaborators (zip collaborators percentages)))
+;;     (fold add-single-collaborator zipped-collaborators { token-id: token-id, success: true })
+;;   )
+;;   (ok true)
+;; )
+
+(define-private (add-single-collaborator 
+  (collab-data { collaborator: principal, percentage: uint })
+  (acc { token-id: uint, success: bool }))
+  
+  (if (get success acc)
+    (begin
+      (map-set collaborator-ownership 
+        { token-id: (get token-id acc), collaborator: (get collaborator collab-data) }
+        {
+          ownership-percentage: (get percentage collab-data),
+          is-active: true,
+          join-date: stacks-block-height
+        }
+      )
+      acc
+    )
+    acc
+  )
+)
+
+(define-private (zip (list-a (list 10 principal)) (list-b (list 10 uint)))
+  (map combine-elements list-a list-b)
+)
+
+(define-private (combine-elements (a principal) (b uint))
+  { collaborator: a, percentage: b }
+)
+
+(define-public (propose-collaborator-change 
+  (token-id uint)
+  (action-type (string-ascii 20))
+  (target-collaborator principal)
+  (new-percentage uint))
+  
+  (let ((action-id (+ (var-get action-counter) u1))
+        (token-info (unwrap! (map-get? collaborative-tokens token-id) err-token-not-found)))
+    
+    (asserts! (is-collaborator token-id tx-sender) err-not-collaborator)
+    
+    (var-set action-counter action-id)
+    
+    (map-set pending-actions 
+      { token-id: token-id, action-id: action-id }
+      {
+        action-type: action-type,
+        target-collaborator: target-collaborator,
+        new-percentage: new-percentage,
+        approvals-count: u1,
+        is-executed: false,
+        created-by: tx-sender
+      }
+    )
+    
+    (map-set collaborator-approvals 
+      { token-id: token-id, action-id: action-id, collaborator: tx-sender }
+      true
+    )
+    
+    (ok action-id)
+  )
+)
+
+(define-public (approve-collaborator-action (token-id uint) (action-id uint))
+  (let ((action (unwrap! (map-get? pending-actions { token-id: token-id, action-id: action-id }) err-token-not-found))
+        (token-info (unwrap! (map-get? collaborative-tokens token-id) err-token-not-found))
+        (current-approvals (get approvals-count action)))
+    
+    (asserts! (is-collaborator token-id tx-sender) err-not-collaborator)
+    (asserts! (not (get is-executed action)) err-unauthorized)
+    (asserts! (is-none (map-get? collaborator-approvals { token-id: token-id, action-id: action-id, collaborator: tx-sender })) err-already-listed)
+    
+    (map-set collaborator-approvals 
+      { token-id: token-id, action-id: action-id, collaborator: tx-sender }
+      true
+    )
+    
+    (let ((new-approvals (+ current-approvals u1)))
+      (map-set pending-actions 
+        { token-id: token-id, action-id: action-id }
+        (merge action { approvals-count: new-approvals })
+      )
+      
+      (if (>= new-approvals (get approval-threshold token-info))
+        (execute-collaborator-action token-id action-id)
+        (ok false)
+      )
+    )
+  )
+)
+(define-private (execute-collaborator-action (token-id uint) (action-id uint))
+  (let ((action (unwrap! (map-get? pending-actions { token-id: token-id, action-id: action-id }) err-token-not-found)))
+    
+    (if (is-eq (get action-type action) "add")
+      (begin
+        (map-set collaborator-ownership 
+          { token-id: token-id, collaborator: (get target-collaborator action) }
+          {
+            ownership-percentage: (get new-percentage action),
+            is-active: true,
+            join-date: stacks-block-height
+          }
+        )
+        (ok true)
+      )
+      (if (is-eq (get action-type action) "remove")
+        (begin
+          (map-set collaborator-ownership 
+            { token-id: token-id, collaborator: (get target-collaborator action) }
+            {
+              ownership-percentage: u0,
+              is-active: false,
+              join-date: stacks-block-height
+            }
+          )
+          (ok true)
+        )
+        (ok false)
+      )
+    )
+  )
+)
+
+(define-public (propose-collaborative-sale (token-id uint) (price uint))
+  (let ((token-info (unwrap! (map-get? collaborative-tokens token-id) err-token-not-found)))
+    
+    (asserts! (is-collaborator token-id tx-sender) err-not-collaborator)
+    (asserts! (> price u0) err-invalid-price)
+    
+    (map-set collaborative-listings token-id {
+      price: price,
+      approvals-count: u1,
+      required-approvals: (get approval-threshold token-info),
+      is-active: true
+    })
+    
+    (map-set listing-approvals 
+      { token-id: token-id, collaborator: tx-sender }
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (approve-collaborative-sale (token-id uint))
+  (let ((listing (unwrap! (map-get? collaborative-listings token-id) err-not-listed))
+        (current-approvals (get approvals-count listing)))
+    
+    (asserts! (is-collaborator token-id tx-sender) err-not-collaborator)
+    (asserts! (get is-active listing) err-not-listed)
+    (asserts! (is-none (map-get? listing-approvals { token-id: token-id, collaborator: tx-sender })) err-already-listed)
+    
+    (map-set listing-approvals 
+      { token-id: token-id, collaborator: tx-sender }
+      true
+    )
+    
+    (map-set collaborative-listings token-id 
+      (merge listing { approvals-count: (+ current-approvals u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (buy-collaborative-license (token-id uint))
+  (let ((listing (unwrap! (map-get? collaborative-listings token-id) err-not-listed))
+        (price (get price listing)))
+    
+    (asserts! (get is-active listing) err-not-listed)
+    (asserts! (>= (get approvals-count listing) (get required-approvals listing)) err-insufficient-approvals)
+    
+    ;; (try! (distribute-collaborative-payment token-id price tx-sender))
+    ;; (try! (nft-transfer? collaborative-music-license token-id (nft-get-owner? collaborative-music-license token-id) tx-sender))
+    
+    (map-delete collaborative-listings token-id)
+    
+    (ok true)
+  )
+)
+
+
+
+(define-private (is-active-collaborator (collaborator principal) (token-id uint))
+  (match (get-collaborator-info token-id collaborator)
+    ownership (get is-active ownership)
+    false
+  )
+)
+
+(define-read-only (get-collaborator-list)
+  (list
+    contract-owner ;; Replace this with actual list of collaborators
+  )
+)
+(define-private (distribute-to-collaborator 
+  (collaborator principal) 
+  (acc { token-id: uint, total: uint, buyer: principal }))
+  
+  (let ((ownership (unwrap! (map-get? collaborator-ownership { token-id: (get token-id acc), collaborator: collaborator }) err-token-not-found)))
+    (let ((percentage (get ownership-percentage ownership))
+          (amount (/ (* (get total acc) percentage) u100)))
+      (try! (stx-transfer? amount (get buyer acc) collaborator))
+      (ok acc)
+    )
+  )
+)
+
+(define-read-only (get-last-collaborative-token-id)
+  (var-get last-collaborative-token-id)
+)
