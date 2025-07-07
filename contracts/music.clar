@@ -310,6 +310,10 @@
 (define-constant err-insufficient-approvals (err u203))
 (define-constant err-collaborator-exists (err u204))
 (define-constant err-cannot-remove-self (err u205))
+(define-constant err-subscription-expired (err u206))
+(define-constant err-subscription-not-found (err u207))
+(define-constant err-invalid-subscription (err u208))
+(define-constant err-subscription-already-exists (err u209))
 
 (define-map collaborative-tokens
   uint
@@ -636,4 +640,144 @@
 
 (define-read-only (get-last-collaborative-token-id)
   (var-get last-collaborative-token-id)
+)
+
+(define-map license-subscriptions
+  uint
+  {
+    monthly-price: uint,
+    is-active: bool,
+    subscriber-count: uint,
+    created-at: uint
+  }
+)
+
+(define-map subscription-records
+  { token-id: uint, subscriber: principal }
+  {
+    start-date: uint,
+    last-payment: uint,
+    payment-amount: uint,
+    is-active: bool
+  }
+)
+
+(define-public (create-subscription-plan (token-id uint) (monthly-price uint))
+  (let ((owner (unwrap! (nft-get-owner? music-license token-id) err-token-not-found)))
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (> monthly-price u0) err-invalid-price)
+    (asserts! (is-none (map-get? license-subscriptions token-id)) err-subscription-already-exists)
+    
+    (map-set license-subscriptions token-id {
+      monthly-price: monthly-price,
+      is-active: true,
+      subscriber-count: u0,
+      created-at: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (subscribe-to-license (token-id uint))
+  (let ((subscription-plan (unwrap! (map-get? license-subscriptions token-id) err-subscription-not-found))
+        (owner (unwrap! (nft-get-owner? music-license token-id) err-token-not-found))
+        (royalty-info (unwrap! (map-get? royalty-recipients token-id) err-token-not-found))
+        (monthly-price (get monthly-price subscription-plan)))
+    
+    (asserts! (get is-active subscription-plan) err-invalid-subscription)
+    (asserts! (is-none (map-get? subscription-records { token-id: token-id, subscriber: tx-sender })) err-subscription-already-exists)
+    
+    (try! (stx-transfer? monthly-price tx-sender owner))
+    (try! (stx-transfer? (/ (* monthly-price (get percentage royalty-info)) u100) owner (get artist royalty-info)))
+    
+    (map-set subscription-records 
+      { token-id: token-id, subscriber: tx-sender }
+      {
+        start-date: stacks-block-height,
+        last-payment: stacks-block-height,
+        payment-amount: monthly-price,
+        is-active: true
+      }
+    )
+    
+    (map-set license-subscriptions token-id 
+      (merge subscription-plan { subscriber-count: (+ (get subscriber-count subscription-plan) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (renew-subscription (token-id uint))
+  (let ((subscription-record (unwrap! (map-get? subscription-records { token-id: token-id, subscriber: tx-sender }) err-subscription-not-found))
+        (subscription-plan (unwrap! (map-get? license-subscriptions token-id) err-subscription-not-found))
+        (owner (unwrap! (nft-get-owner? music-license token-id) err-token-not-found))
+        (royalty-info (unwrap! (map-get? royalty-recipients token-id) err-token-not-found))
+        (monthly-price (get monthly-price subscription-plan)))
+    
+    (asserts! (get is-active subscription-record) err-subscription-expired)
+    (asserts! (get is-active subscription-plan) err-invalid-subscription)
+    
+    (try! (stx-transfer? monthly-price tx-sender owner))
+    (try! (stx-transfer? (/ (* monthly-price (get percentage royalty-info)) u100) owner (get artist royalty-info)))
+    
+    (map-set subscription-records 
+      { token-id: token-id, subscriber: tx-sender }
+      (merge subscription-record { last-payment: stacks-block-height })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (token-id uint))
+  (let ((subscription-record (unwrap! (map-get? subscription-records { token-id: token-id, subscriber: tx-sender }) err-subscription-not-found))
+        (subscription-plan (unwrap! (map-get? license-subscriptions token-id) err-subscription-not-found)))
+    
+    (asserts! (get is-active subscription-record) err-subscription-expired)
+    
+    (map-set subscription-records 
+      { token-id: token-id, subscriber: tx-sender }
+      (merge subscription-record { is-active: false })
+    )
+    
+    (map-set license-subscriptions token-id 
+      (merge subscription-plan { subscriber-count: (- (get subscriber-count subscription-plan) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-subscription-plan (token-id uint))
+  (let ((owner (unwrap! (nft-get-owner? music-license token-id) err-token-not-found))
+        (subscription-plan (unwrap! (map-get? license-subscriptions token-id) err-subscription-not-found)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    
+    (map-set license-subscriptions token-id 
+      (merge subscription-plan { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription-plan (token-id uint))
+  (map-get? license-subscriptions token-id)
+)
+
+(define-read-only (get-subscription-status (token-id uint) (subscriber principal))
+  (map-get? subscription-records { token-id: token-id, subscriber: subscriber })
+)
+
+(define-read-only (is-subscription-active (token-id uint) (subscriber principal))
+  (match (map-get? subscription-records { token-id: token-id, subscriber: subscriber })
+    record (and 
+      (get is-active record)
+      (< (- stacks-block-height (get last-payment record)) u4320)
+    )
+    false
+  )
 )
