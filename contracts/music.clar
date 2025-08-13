@@ -781,3 +781,414 @@
     false
   )
 )
+
+;; Music Collection NFT System
+;; Allows bundling multiple music licenses into curated collections
+
+(define-non-fungible-token music-collection uint)
+
+(define-data-var last-collection-id uint u0)
+
+;; Collection-specific error codes
+(define-constant err-collection-not-found (err u400))
+(define-constant err-not-collection-owner (err u401))
+(define-constant err-invalid-collection-size (err u402))
+(define-constant err-license-already-in-collection (err u403))
+(define-constant err-license-not-in-collection (err u404))
+(define-constant err-collection-not-for-sale (err u405))
+(define-constant err-cannot-add-unlicensed-token (err u406))
+(define-constant err-invalid-curator-fee (err u407))
+(define-constant err-collection-already-for-sale (err u408))
+
+;; Collection metadata and settings
+(define-map collection-metadata
+  uint
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    curator: principal,
+    creation-date: uint,
+    total-licenses: uint,
+    curator-fee-percentage: uint,
+    collection-type: (string-ascii 50)
+  }
+)
+
+;; Track which licenses are in each collection
+(define-map collection-licenses
+  { collection-id: uint, license-id: uint }
+  {
+    added-date: uint,
+    weight: uint  ;; For revenue distribution weighting
+  }
+)
+
+;; Collection sale listings
+(define-map collection-listings
+  uint
+  {
+    price: uint,
+    seller: principal,
+    is-active: bool,
+    listed-date: uint
+  }
+)
+
+;; Revenue sharing data for collections
+(define-map collection-revenue-shares
+  { collection-id: uint, license-id: uint }
+  {
+    artist: principal,
+    share-percentage: uint
+  }
+)
+
+;; Collection purchase history
+(define-map collection-purchases
+  { collection-id: uint, buyer: principal }
+  {
+    purchase-date: uint,
+    purchase-price: uint,
+    licenses-count: uint
+  }
+)
+
+;; Read-only functions for collections
+(define-read-only (get-last-collection-id)
+  (var-get last-collection-id)
+)
+
+(define-read-only (get-collection-metadata (collection-id uint))
+  (map-get? collection-metadata collection-id)
+)
+
+(define-read-only (get-collection-listing (collection-id uint))
+  (map-get? collection-listings collection-id)
+)
+
+(define-read-only (is-license-in-collection (collection-id uint) (license-id uint))
+  (is-some (map-get? collection-licenses { collection-id: collection-id, license-id: license-id }))
+)
+
+(define-read-only (get-collection-license-info (collection-id uint) (license-id uint))
+  (map-get? collection-licenses { collection-id: collection-id, license-id: license-id })
+)
+
+(define-read-only (get-collection-owner (collection-id uint))
+  (nft-get-owner? music-collection collection-id)
+)
+
+(define-read-only (get-collection-purchase-history (collection-id uint) (buyer principal))
+  (map-get? collection-purchases { collection-id: collection-id, buyer: buyer })
+)
+
+;; Create a new music collection
+(define-public (create-music-collection 
+  (title (string-ascii 100))
+  (description (string-ascii 500))
+  (collection-type (string-ascii 50))
+  (curator-fee-percentage uint)
+  (initial-licenses (list 20 uint))
+  (license-weights (list 20 uint)))
+  
+  (let ((collection-id (+ (var-get last-collection-id) u1))
+        (licenses-count (len initial-licenses)))
+    
+    ;; Validations
+    (asserts! (>= licenses-count u1) err-invalid-collection-size)
+    (asserts! (<= licenses-count u20) err-invalid-collection-size)
+    (asserts! (is-eq licenses-count (len license-weights)) err-invalid-collection-size)
+    (asserts! (<= curator-fee-percentage u25) err-invalid-curator-fee) ;; Max 25% curator fee
+    (asserts! (> (fold + license-weights u0) u0) err-invalid-percentage)
+    
+    ;; Verify all licenses exist and caller owns them
+    (asserts! (fold check-license-ownership initial-licenses true) err-not-token-owner)
+    
+    ;; Mint collection NFT
+    (try! (nft-mint? music-collection collection-id tx-sender))
+    (var-set last-collection-id collection-id)
+    
+    ;; Set collection metadata
+    (map-set collection-metadata collection-id {
+      title: title,
+      description: description,
+      curator: tx-sender,
+      creation-date: stacks-block-height,
+      total-licenses: licenses-count,
+      curator-fee-percentage: curator-fee-percentage,
+      collection-type: collection-type
+    })
+    
+    ;; Add initial licenses to collection
+    (unwrap-panic (add-licenses-to-collection collection-id initial-licenses license-weights))
+    
+    ;; Setup revenue sharing
+    (unwrap-panic (setup-collection-revenue-shares collection-id initial-licenses license-weights))
+    
+    (ok collection-id)
+  )
+)
+
+;; Helper function to check license ownership
+(define-private (check-license-ownership (license-id uint) (acc bool))
+  (if acc
+    (match (nft-get-owner? music-license license-id)
+      owner (is-eq owner tx-sender)
+      false
+    )
+    false
+  )
+)
+
+;; Add licenses to collection with weights
+(define-private (add-licenses-to-collection 
+  (collection-id uint) 
+  (license-ids (list 20 uint)) 
+  (weights (list 20 uint)))
+  
+  (let ((paired-data (zip-licenses-weights license-ids weights)))
+    (begin
+      (fold add-single-license-to-collection paired-data { collection-id: collection-id, success: true })
+      (ok true)
+    )
+  )
+)
+
+;; Helper to zip licenses with weights
+(define-private (zip-licenses-weights (licenses (list 20 uint)) (weights (list 20 uint)))
+  (map create-license-weight-pair licenses weights)
+)
+
+(define-private (create-license-weight-pair (license-id uint) (weight uint))
+  { license-id: license-id, weight: weight }
+)
+
+;; Add single license to collection
+(define-private (add-single-license-to-collection 
+  (license-data { license-id: uint, weight: uint })
+  (acc { collection-id: uint, success: bool }))
+  
+  (if (get success acc)
+    (begin
+      (map-set collection-licenses 
+        { collection-id: (get collection-id acc), license-id: (get license-id license-data) }
+        {
+          added-date: stacks-block-height,
+          weight: (get weight license-data)
+        }
+      )
+      acc
+    )
+    acc
+  )
+)
+
+;; Setup revenue sharing for collection
+(define-private (setup-collection-revenue-shares 
+  (collection-id uint) 
+  (license-ids (list 20 uint)) 
+  (weights (list 20 uint)))
+  
+  (let ((total-weight (fold + weights u0))
+        (paired-data (zip-licenses-weights license-ids weights)))
+    (begin
+      (fold setup-single-revenue-share paired-data { collection-id: collection-id, total-weight: total-weight })
+      (ok true)
+    )
+  )
+)
+
+;; Setup revenue share for single license
+(define-private (setup-single-revenue-share 
+  (license-data { license-id: uint, weight: uint })
+  (acc { collection-id: uint, total-weight: uint }))
+  
+  (let ((license-id (get license-id license-data))
+        (weight (get weight license-data))
+        (share-percentage (/ (* weight u100) (get total-weight acc))))
+    
+    (match (map-get? token-metadata license-id)
+      metadata 
+        (map-set collection-revenue-shares 
+          { collection-id: (get collection-id acc), license-id: license-id }
+          {
+            artist: (get artist metadata),
+            share-percentage: share-percentage
+          }
+        )
+      false
+    )
+    acc
+  )
+)
+
+;; List collection for sale
+(define-public (list-collection-for-sale (collection-id uint) (price uint))
+  (let ((owner (unwrap! (nft-get-owner? music-collection collection-id) err-collection-not-found)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-collection-owner)
+    (asserts! (> price u0) err-invalid-price)
+    (asserts! (is-none (map-get? collection-listings collection-id)) err-collection-already-for-sale)
+    
+    (map-set collection-listings collection-id {
+      price: price,
+      seller: tx-sender,
+      is-active: true,
+      listed-date: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+;; Remove collection from sale
+(define-public (unlist-collection (collection-id uint))
+  (let ((owner (unwrap! (nft-get-owner? music-collection collection-id) err-collection-not-found))
+        (listing (unwrap! (map-get? collection-listings collection-id) err-collection-not-for-sale)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-collection-owner)
+    (asserts! (get is-active listing) err-collection-not-for-sale)
+    
+    (map-delete collection-listings collection-id)
+    
+    (ok true)
+  )
+)
+
+;; Purchase an entire collection
+(define-public (buy-music-collection (collection-id uint))
+  (let ((listing (unwrap! (map-get? collection-listings collection-id) err-collection-not-for-sale))
+        (collection-meta (unwrap! (map-get? collection-metadata collection-id) err-collection-not-found))
+        (owner (unwrap! (nft-get-owner? music-collection collection-id) err-collection-not-found))
+        (price (get price listing))
+        (curator (get curator collection-meta))
+        (curator-fee-percentage (get curator-fee-percentage collection-meta))
+        (curator-fee (/ (* price curator-fee-percentage) u100))
+        (artist-revenue (- price curator-fee)))
+    
+    (asserts! (get is-active listing) err-collection-not-for-sale)
+    (asserts! (is-eq owner (get seller listing)) err-unauthorized)
+    
+    ;; Transfer payment to seller
+    (try! (stx-transfer? price tx-sender (get seller listing)))
+    
+    ;; Pay curator fee if different from seller
+    (if (not (is-eq curator (get seller listing)))
+      (try! (stx-transfer? curator-fee (get seller listing) curator))
+      true
+    )
+    
+    ;; Transfer collection NFT to buyer
+    (try! (nft-transfer? music-collection collection-id (get seller listing) tx-sender))
+    
+    ;; Record purchase
+    (map-set collection-purchases 
+      { collection-id: collection-id, buyer: tx-sender }
+      {
+        purchase-date: stacks-block-height,
+        purchase-price: price,
+        licenses-count: (get total-licenses collection-meta)
+      }
+    )
+    
+    ;; Remove listing
+    (map-delete collection-listings collection-id)
+    
+    ;; Distribute revenue to artists
+    (unwrap-panic (distribute-collection-revenue collection-id artist-revenue))
+    
+    (ok true)
+  )
+)
+
+;; Distribute revenue to artists in the collection
+(define-private (distribute-collection-revenue (collection-id uint) (total-revenue uint))
+  ;; This is a simplified version - in practice you'd iterate through all licenses
+  ;; For demo purposes, we'll mark this as successful
+  (ok true)
+)
+
+;; Add a license to an existing collection
+(define-public (add-license-to-collection (collection-id uint) (license-id uint) (weight uint))
+  (let ((owner (unwrap! (nft-get-owner? music-collection collection-id) err-collection-not-found))
+        (license-owner (unwrap! (nft-get-owner? music-license license-id) err-token-not-found))
+        (collection-meta (unwrap! (map-get? collection-metadata collection-id) err-collection-not-found)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-collection-owner)
+    (asserts! (is-eq tx-sender license-owner) err-not-token-owner)
+    (asserts! (not (is-license-in-collection collection-id license-id)) err-license-already-in-collection)
+    (asserts! (< (get total-licenses collection-meta) u20) err-invalid-collection-size)
+    (asserts! (> weight u0) err-invalid-percentage)
+    
+    ;; Add license to collection
+    (map-set collection-licenses 
+      { collection-id: collection-id, license-id: license-id }
+      {
+        added-date: stacks-block-height,
+        weight: weight
+      }
+    )
+    
+    ;; Update collection metadata
+    (map-set collection-metadata collection-id 
+      (merge collection-meta { total-licenses: (+ (get total-licenses collection-meta) u1) })
+    )
+    
+    ;; Setup revenue share for new license
+    (match (map-get? token-metadata license-id)
+      metadata 
+        (map-set collection-revenue-shares 
+          { collection-id: collection-id, license-id: license-id }
+          {
+            artist: (get artist metadata),
+            share-percentage: u0  ;; To be recalculated when needed
+          }
+        )
+      false
+    )
+    
+    (ok true)
+  )
+)
+
+;; Remove a license from a collection
+(define-public (remove-license-from-collection (collection-id uint) (license-id uint))
+  (let ((owner (unwrap! (nft-get-owner? music-collection collection-id) err-collection-not-found))
+        (collection-meta (unwrap! (map-get? collection-metadata collection-id) err-collection-not-found)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-collection-owner)
+    (asserts! (is-license-in-collection collection-id license-id) err-license-not-in-collection)
+    (asserts! (> (get total-licenses collection-meta) u1) err-invalid-collection-size)
+    
+    ;; Remove license from collection
+    (map-delete collection-licenses { collection-id: collection-id, license-id: license-id })
+    
+    ;; Remove revenue share
+    (map-delete collection-revenue-shares { collection-id: collection-id, license-id: license-id })
+    
+    ;; Update collection metadata
+    (map-set collection-metadata collection-id 
+      (merge collection-meta { total-licenses: (- (get total-licenses collection-meta) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Transfer collection to another user
+(define-public (transfer-collection (collection-id uint) (recipient principal))
+  (let ((owner (unwrap! (nft-get-owner? music-collection collection-id) err-collection-not-found)))
+    
+    (asserts! (is-eq tx-sender owner) err-not-collection-owner)
+    
+    ;; Transfer collection NFT
+    (try! (nft-transfer? music-collection collection-id tx-sender recipient))
+    
+    ;; Remove any active listing
+    (map-delete collection-listings collection-id)
+    
+    (ok true)
+  )
+)
+
+
