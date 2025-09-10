@@ -62,6 +62,59 @@ This smart contract enables musicians and artists to tokenize their music licens
 (contract-call? .music buy-license u1)
 ```
 
+## License Analytics Extension
+
+The `music-analytics` contract provides comprehensive performance tracking and insights for music licenses:
+
+### Features
+
+- **Performance Metrics**: Track views, revenue, and popularity scores for each license
+- **Geographic Analytics**: Monitor usage patterns across different regions 
+- **Artist Insights**: Aggregate performance data for artists across all their licenses
+- **Daily Revenue Tracking**: Detailed day-by-day revenue breakdown
+- **License Rankings**: Dynamic popularity-based ranking system
+
+### Analytics Functions
+
+#### Recording Events
+
+```clarity
+;; Record a license view/usage event
+(contract-call? .music-analytics record-license-view u1 "US")
+
+;; Record revenue from license usage
+(contract-call? .music-analytics record-license-revenue u1 u1000000 "EU")
+
+;; Update artist stats
+(contract-call? .music-analytics update-artist-stats 'ST1ARTIST123 u5)
+```
+
+#### Querying Analytics
+
+```clarity
+;; Get comprehensive license statistics
+(contract-call? .music-analytics get-license-stats u1)
+
+;; Check license performance summary
+(contract-call? .music-analytics get-license-performance u1)
+
+;; View geographic usage for a region
+(contract-call? .music-analytics get-geographic-usage u1 "ASIA")
+
+;; Get daily revenue data
+(contract-call? .music-analytics get-daily-revenue u1 u100)
+
+;; View artist analytics
+(contract-call? .music-analytics get-artist-analytics 'ST1ARTIST123)
+```
+
+### Use Cases
+
+1. **Artists** can track performance metrics across all their licenses
+2. **License holders** can monitor usage patterns and revenue trends
+3. **Platforms** can identify trending content and popular territories
+4. **Analytics dashboards** can provide insights for strategic decisions
+
 ## License
 
 This project is licensed under the MIT License.
